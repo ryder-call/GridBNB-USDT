@@ -16,8 +16,11 @@ COPY . /app
 # 安装依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 添加调试命令查看文件是否存在
-RUN ls -la /app
+# 创建备份目录
+RUN cp -r /app /app_backup
 
-# 设置默认启动命令，先检查文件是否存在
-CMD ["/bin/bash", "-c", "ls -la /app && echo '检查main.py是否存在' && (test -f /app/main.py && echo 'main.py存在' || echo 'main.py不存在') && python main.py"]
+# 创建启动脚本
+RUN echo '#!/bin/bash\nif [ ! -f /app/main.py ]; then\n  echo "检测到main.py不存在，正在从备份恢复..."\n  cp -r /app_backup/* /app/\n  echo "文件已恢复"\nfi\npython /app/main.py' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+# 设置默认启动命令
+ENTRYPOINT ["/app/entrypoint.sh"]
