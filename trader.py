@@ -527,6 +527,9 @@ class GridTrader:
                     self.logger.info(f"订单已成交 | ID: {order_id}")
                     # 更新基准价
                     self.base_price = float(updated_order['price'])
+                    # 重置最高价和最低价
+                    self.highest = None
+                    self.lowest = None
                     # 清除活跃订单状态
                     self.active_orders[side] = None
                     
@@ -588,6 +591,9 @@ class GridTrader:
                             self.logger.info(f"订单已经成交 | ID: {order_id}")
                             # 处理已成交的订单（与上面相同的逻辑）
                             self.base_price = float(check_order['price'])
+                            # 重置最高价和最低价
+                            self.highest = None
+                            self.lowest = None
                             self.active_orders[side] = None
                             trade_info = {
                                 'timestamp': time.time(),
