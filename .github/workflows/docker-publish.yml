@@ -20,6 +20,13 @@ jobs:
       - name: Checkout repository # 步骤1：签出代码
         uses: actions/checkout@v3
 
+      # 添加检查步骤，列出当前目录文件
+      - name: List workspace files
+        run: |
+          ls -la
+          echo "确认 main.py 是否存在:"
+          test -f main.py && echo "main.py exists" || echo "main.py DOES NOT exist"
+
       - name: Log in to the Container registry # 步骤2：登录 GHCR
         # 使用 docker/login-action 来登录
         uses: docker/login-action@v2
@@ -58,3 +65,11 @@ jobs:
           push: true # 确认执行推送
           tags: ${{ steps.meta.outputs.tags }} # 使用上一步生成的标签
           labels: ${{ steps.meta.outputs.labels }} # 使用上一步生成的标签
+          
+      # 构建后检查镜像内容
+      - name: Verify image contents
+        run: |
+          # 拉取刚刚构建的镜像
+          docker pull $(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
+          # 使用镜像运行一个临时容器并列出 /app 目录内容
+          docker run --rm $(echo "${{ steps.meta.outputs.tags }}" | head -n 1) ls -la /app
