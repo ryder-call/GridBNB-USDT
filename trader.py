@@ -462,7 +462,7 @@ class GridTrader:
             self.logger.error(f"获取仓位比例失败: {str(e)}")
             return 0
 
-    async def execute_order(self, side):
+    async def execute_order(self, side, target_amount_usdt=None):
         """执行订单，带重试机制"""
         max_retries = 10  # 最大重试次数
         retry_count = 0
@@ -485,16 +485,19 @@ class GridTrader:
                     order_price = order_book['bids'][0][0]  # 买1价卖出
 
                 # 计算交易数量
-                amount_usdt = await self._calculate_order_amount(side)
+                if target_amount_usdt is None:
+                    amount_usdt = await self._calculate_order_amount(side)
+                else:
+                    amount_usdt = target_amount_usdt
                 amount = self._adjust_amount_precision(amount_usdt / order_price)
                 
                 # 检查余额是否足够
                 if side == 'buy':
-                    if not await self.check_buy_balance(order_price):
+                    if not await self.check_buy_balance(order_price, amount_usdt_override=amount_usdt):
                         self.logger.warning(f"买入余额不足，第 {retry_count + 1} 次尝试中止")
                         return False
-                else:
-                    if not await self.check_sell_balance():
+                else: # sell
+                    if not await self.check_sell_balance(order_price, amount_usdt_override=amount_usdt):
                         self.logger.warning(f"卖出余额不足，第 {retry_count + 1} 次尝试中止")
                         return False
 
@@ -1490,11 +1493,14 @@ class GridTrader:
             ema = (price - ema) * multiplier + ema
         return ema
     
-    async def check_buy_balance(self, current_price):
+    async def check_buy_balance(self, current_price, amount_usdt_override=None):
         """检查买入前的余额，如果不够则从理财赎回"""
         try:
             # 计算所需买入资金
-            amount_usdt = await self._calculate_order_amount('buy')
+            if amount_usdt_override is None:
+                amount_usdt = await self._calculate_order_amount('buy')
+            else:
+                amount_usdt = amount_usdt_override
             
             # 获取现货余额
             spot_balance = await self.exchange.fetch_balance({'type': 'spot'})
@@ -1562,7 +1568,7 @@ class GridTrader:
             send_pushplus_message(f"余额检查错误\\n交易类型: 买入\\n错误信息: {str(e)}", "系统错误")
             return False
             
-    async def check_sell_balance(self):
+    async def check_sell_balance(self, order_price, amount_usdt_override=None):
         """检查卖出前的余额，如果不够则从理财赎回"""
         try:
             # 获取现货余额
@@ -1576,16 +1582,21 @@ class GridTrader:
             spot_bnb = float(spot_balance.get('free', {}).get('BNB', 0) or 0)
             
             # 计算所需数量
-            amount_usdt = await self._calculate_order_amount('sell')
+            if amount_usdt_override is None:
+                amount_usdt = await self._calculate_order_amount('sell')
+            else:
+                amount_usdt = amount_usdt_override
             
-            # 确保当前价格有效
-            if not self.current_price or self.current_price <= 0:
-                self.logger.error("当前价格无效，无法计算BNB需求量")
+            # 确保传入的 order_price 有效，用它来计算 bnb_needed
+            if not order_price or order_price <= 0:
+                self.logger.error(f"卖出余额检查：无效的订单价格 ({order_price})，无法计算BNB需求量")
+                # 可以选择使用 self.current_price 作为备用，或者直接返回False
+                # 为保持一致性，如果下单价格无效，则认为无法准确检查余额
                 return False
                 
-            bnb_needed = amount_usdt / self.current_price
+            bnb_needed = amount_usdt / order_price # 使用传入的 order_price
             
-            self.logger.info(f"卖出前余额检查 | 所需BNB: {bnb_needed:.8f} | 现货BNB: {spot_bnb:.8f}")
+            self.logger.info(f"卖出前余额检查 | 目标USDT: {amount_usdt:.2f} | 参考价: {order_price} | 所需BNB: {bnb_needed:.8f} | 现货BNB: {spot_bnb:.8f}")
             
             # 如果现货余额足够，直接返回成功
             if spot_bnb >= bnb_needed:
