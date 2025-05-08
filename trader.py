@@ -237,7 +237,7 @@ class GridTrader:
                 self.buying_or_selling = False # 不在买入或卖出
                 self.logger.info(f"触发卖出信号 | 当前价: {current_price:.2f} | 目标价: {self.highest * (1 - threshold):.5f} | 已下跌: {(1-current_price/self.highest)*100:.2f}%")
                 # 检查卖出余额是否充足
-                if not await self.check_sell_balance():
+                if not await self.check_sell_balance(self.current_price):
                     return False
                 return True
         else:
