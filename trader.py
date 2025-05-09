@@ -57,7 +57,7 @@ class GridTrader:
             'data': {}
         }
         self.funding_cache_ttl = 60  # 理财余额缓存60秒
-        self.position_controller_s1 = PositionControllerS1(self)
+        self.position_controller_s1 = PositionControllerS1(self) # 确保在 __init__ 中传递 self
         self.buying_or_selling = False #不在等待买入或卖出
 
     async def initialize(self):
@@ -325,9 +325,11 @@ class GridTrader:
             try:
                 if not self.initialized:
                     await self.initialize()
+                    # 初始化后也调用一次S1级别和趋势更新
                     await self.position_controller_s1.update_daily_s1_levels()
 
-                # 保留S1水平更新
+                # 每次循环开始时更新S1水平和趋势判断
+                # 这个方法现在同时处理S1的levels和补仓的趋势判断
                 await self.position_controller_s1.update_daily_s1_levels()
 
                 # 获取当前价格
@@ -347,24 +349,84 @@ class GridTrader:
                     if buy_signal:
                         await self.execute_order('buy')
                     else:
-                        # 只有在没有交易信号时才执行其他操作
-                        
-                        # 执行风控检查
-                        if await self.risk_manager.multi_layer_check():
+                        # 没有常规网格交易信号时
+                        # is_risk_triggered, risk_reason = await self.risk_manager.multi_layer_check()
+                        # 假设 multi_layer_check 返回 (bool, reason_string)
+                        # 为简化，我们先获取风险状态，再判断具体原因
+                        is_risk_triggered = await self.risk_manager.multi_layer_check()
+
+                        if is_risk_triggered:
+                            current_position_ratio = await self.risk_manager._get_position_ratio() # 获取最新的仓位比例
+                            # 我们主要关心是否因为底仓不足触发的风控
+                            if current_position_ratio < self.config.MIN_POSITION_RATIO:
+                                self.logger.info(f"底仓不足 ({current_position_ratio:.2%})，检查主动补仓条件...")
+                                
+                                # 1. 趋势条件检查
+                                allow_trend_replenish = self.position_controller_s1.allow_replenish_based_on_trend
+                                if not allow_trend_replenish:
+                                    self.logger.info("主动补仓条件检查：趋势判断不允许补仓。")
+                                else:
+                                    self.logger.info("主动补仓条件检查：趋势判断允许补仓。")
+                                    # 2. 极端价格区域检查 (例如，不在过去180天日线价格的顶部10%)
+                                    # 使用日线数据判断长期高位
+                                    long_term_price_percentile = await self._get_price_percentile(timeframe='1d', limit=180)
+                                    HIGH_PERCENTILE_THRESHOLD = getattr(self.config, 'REPLENISH_HIGH_PERCENTILE_THRESHOLD', 0.90) # 从配置读取或默认0.90
+                                    
+                                    if long_term_price_percentile >= HIGH_PERCENTILE_THRESHOLD:
+                                        self.logger.info(
+                                            f"主动补仓条件检查：当前价格处于过去180日价格的较高区域 "
+                                            f"(分位: {long_term_price_percentile*100:.1f}%，阈值: {HIGH_PERCENTILE_THRESHOLD*100:.1f}%)，不允许补仓。"
+                                        )
+                                    else:
+                                        self.logger.info(
+                                            f"主动补仓条件检查：当前价格未处于极端高位 (分位: {long_term_price_percentile*100:.1f}%). "
+                                            "准备执行主动补仓计算。"
+                                        )
+                                        # --- 执行主动补仓逻辑 ---
+                                        try:
+                                            total_assets = await self._get_total_assets()
+                                            if total_assets > 0 and self.current_price and self.current_price > 0:
+                                                target_ratio_for_rebalance = self.config.MIN_POSITION_RATIO + 0.005 # 目标比例增加0.5%缓冲
+                                                target_bnb_value = total_assets * target_ratio_for_rebalance
+                                                current_bnb_value = total_assets * current_position_ratio
+                                                usdt_to_buy_for_min_pos = target_bnb_value - current_bnb_value
+
+                                                if usdt_to_buy_for_min_pos >= self.config.MIN_TRADE_AMOUNT:
+                                                    self.logger.info(f"计划主动买入价值 {usdt_to_buy_for_min_pos:.2f} USDT 的 BNB 以补充底仓。")
+                                                    buy_success = await self.execute_order(
+                                                        'buy',
+                                                        target_amount_usdt=usdt_to_buy_for_min_pos,
+                                                        update_grid_params_on_success=False
+                                                    )
+                                                    if buy_success:
+                                                        self.logger.info(f"主动补仓买入成功。")
+                                                    else:
+                                                        self.logger.warning(f"主动补仓买入失败。")
+                                                else:
+                                                    self.logger.info(f"计算出的补仓金额 {usdt_to_buy_for_min_pos:.2f} USDT 过小 (低于MIN_TRADE_AMOUNT)或为负，跳过主动补仓。")
+                                            else:
+                                                self.logger.warning("无法获取总资产或当前价格用于主动补仓计算。")
+                                        except Exception as e_rebalance:
+                                            self.logger.error(f"主动补仓计算或执行逻辑出错: {e_rebalance}", exc_info=True)
+                            else:
+                                # 风控触发，但不是因为底仓不足（例如可能是最大仓位超限等其他原因）
+                                self.logger.warning(f"风控检查触发，但非底仓不足 (当前仓位: {current_position_ratio:.2%})。不执行主动补仓。")
+                            
                             await asyncio.sleep(5)
                             continue
-
+                        
+                        # 如果风控检查通过 (is_risk_triggered is False)
                         # 执行S1策略
                         await self.position_controller_s1.check_and_execute()
                         
                         # 如果时间到了并且不在买入或卖出调整网格大小
                         dynamic_interval_seconds = await self._calculate_dynamic_interval_seconds()
                         if time.time() - self.last_grid_adjust_time > dynamic_interval_seconds and not self.buying_or_selling:
-                            self.logger.info(f"时间到了，准备调整网格大小 (间隔: {dynamic_interval_seconds/3600} 小时).")
+                            self.logger.info(f"时间到了，准备调整网格大小 (间隔: {dynamic_interval_seconds/3600:.2f} 小时).")
                             await self.adjust_grid_size()
                             self.last_grid_adjust_time = time.time()
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(5) # 主循环的固定休眠
 
             except Exception as e:
                 self.logger.error(f"Main loop error: {e}", exc_info=True)
@@ -1037,36 +1099,53 @@ class GridTrader:
             self.logger.error(f"获取订单价格失败: {str(e)}")
             raise
 
-    async def _get_price_percentile(self, period='7d'):
-        """获取当前价格在历史中的分位位置"""
+    async def _get_price_percentile(self, timeframe='1d', limit=180):
+        """获取当前价格在指定历史周期内的分位值 (0.0 to 1.0).
+        返回值越接近1.0，表示当前价格在历史数据中越高。
+        """
         try:
-            # 获取过去7天价格数据（使用4小时K线）
-            ohlcv = await self.exchange.fetch_ohlcv(self.config.SYMBOL, '4h', limit=42)  # 42根4小时K线 ≈ 7天
-            closes = [candle[4] for candle in ohlcv]
-            current_price = await self._get_latest_price()
+            # 获取历史K线数据。多取一根K线，最后一根用来确定比较价格，之前的是历史数据。
+            ohlcv = await self.exchange.fetch_ohlcv(self.config.SYMBOL, timeframe, limit=limit + 1)
             
-            # 计算分位值
-            sorted_prices = sorted(closes)
-            lower = sorted_prices[int(len(sorted_prices)*0.25)]  # 25%分位
-            upper = sorted_prices[int(len(sorted_prices)*0.75)]  # 75%分位
+            if not ohlcv or len(ohlcv) <= limit * 0.5: # 需要足够的数据点, e.g. 至少一半
+                self.logger.warning(f"获取价格分位数据不足: timeframe={timeframe}, limit={limit}, 得到 {len(ohlcv) if ohlcv else 0} 根K线.")
+                return 0.5 # 数据不足时返回中性值
+
+            # 使用倒数第二根K线及之前的所有收盘价作为历史数据
+            historical_closes = [float(candle[4]) for candle in ohlcv[:-1]]
+            # 使用最新一根K线的收盘价作为当前需要比较的价格
+            current_price_for_percentile = float(ohlcv[-1][4])
+
+            if not historical_closes:
+                self.logger.warning(f"历史收盘价数据为空 (timeframe={timeframe}, limit={limit})，无法计算价格分位。")
+                return 0.5
+
+            # 计算 current_price_for_percentile 在 historical_closes 中的百分位
+            # (有多少历史价格 < 当前价格) / 总历史价格数
+            # 为了更精确，可以使用 (num_less + 0.5 * num_equal) / total_count
+            num_less = 0
+            num_equal = 0
+            for p_hist in historical_closes:
+                if p_hist < current_price_for_percentile:
+                    num_less += 1
+                elif p_hist == current_price_for_percentile:
+                    num_equal += 1
             
-            # 添加数据有效性检查
-            if len(sorted_prices) < 10:  # 当数据不足时使用更宽松的判断
-                self.logger.warning("历史数据不足，使用简化分位计算")
-                mid_price = (sorted_prices[0] + sorted_prices[-1]) / 2
-                return 0.5 if current_price >= mid_price else 0.0
+            total_historical_points = len(historical_closes)
+            if total_historical_points == 0: # 理论上不会到这里
+                 return 0.5
+
+            percentile = (num_less + 0.5 * num_equal) / total_historical_points
             
-            # 计算当前价格位置
-            if current_price <= lower:
-                return 0.0  # 处于低位
-            elif current_price >= upper:
-                return 1.0  # 处于高位
-            else:
-                return (current_price - lower) / (upper - lower)
-            
+            self.logger.debug(
+                f"价格分位计算: 当前比较价格 {current_price_for_percentile:.4f} (基于 {timeframe} 最新K线收盘价), "
+                f"历史周期 {timeframe}, 历史K线数 {total_historical_points}, 计算分位 {percentile:.4f}"
+            )
+            return min(max(percentile, 0.0), 1.0) #确保在0-1之间
+
         except Exception as e:
-            self.logger.error(f"获取价格分位失败: {str(e)}")
-            return 0.5  # 默认中间位置
+            self.logger.error(f"计算价格分位失败 (timeframe={timeframe}, limit={limit}): {str(e)}", exc_info=True)
+            return 0.5 # 出错时返回中性值
 
     async def _calculate_required_funds(self, side):
         """计算需要划转的资金量"""

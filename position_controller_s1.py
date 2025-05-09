@@ -33,12 +33,20 @@ class PositionControllerS1:
         self.s1_daily_low = None
         self.s1_last_data_update_ts = 0
         # 每日更新时间间隔（秒），略小于24小时确保不会错过
-        self.daily_update_interval = 23.9 * 60 * 60 
+        self.daily_update_interval = 23.9 * 60 * 60
 
-        self.logger.info(f"S1 Position Controller initialized. Lookback={self.s1_lookback} days, Sell Target={self.s1_sell_target_pct*100}%, Buy Target={self.s1_buy_target_pct*100}%.")
+        # 新增趋势状态属性
+        self.trend_status = {
+            'short_ema_bullish': None, # 例如 12 EMA > 26 EMA
+            'macd_bullish': None,      # 例如 MACD Histogram > 0
+            'long_ema_bullish': None   # 例如 Current Price > 200-day EMA
+        }
+        self.allow_replenish_based_on_trend = False # 综合趋势判断结果
+        
+        self.logger.info(f"S1 Position Controller initialized. Lookback={self.s1_lookback} days, Sell Target={self.s1_sell_target_pct*100}%, Buy Target={self.s1_buy_target_pct*100}%. Trend check also active.")
 
     async def _fetch_and_calculate_s1_levels(self):
-        """获取日线数据并计算52日高低点"""
+        """获取日线数据并计算S1策略所需的回看期高低点"""
         try:
             # 获取比回看期稍多的日线数据 (+2 buffer)
             limit = self.s1_lookback + 2
@@ -72,12 +80,79 @@ class PositionControllerS1:
             return False
 
     async def update_daily_s1_levels(self):
-        """每日检查并更新一次S1所需的52日高低价"""
+        """
+        每日检查并更新一次S1所需的回看期高低价，并进行趋势判断。
+        """
         now = time.time()
+        s1_levels_updated_this_cycle = False
         if now - self.s1_last_data_update_ts >= self.daily_update_interval:
-            self.logger.info("S1: Time to update daily high/low levels...")
-            await self._fetch_and_calculate_s1_levels()
-        # else: 不需要更新
+            self.logger.info("S1: Time to update daily high/low levels for S1 strategy...")
+            s1_levels_updated_this_cycle = await self._fetch_and_calculate_s1_levels()
+        
+        # --- 趋势判断逻辑 ---
+        try:
+            self.logger.debug("S1 Controller: Updating trend analysis for replenish decisions...")
+
+            # 1. 短期趋势: 12 EMA vs 26 EMA (使用1小时图)
+            short_ma, long_ma_for_short_trend = await self.trader.get_ma_data(short_period=12, long_period=26)
+            if short_ma is not None and long_ma_for_short_trend is not None:
+                self.trend_status['short_ema_bullish'] = short_ma > long_ma_for_short_trend
+                self.logger.debug(f"Trend: Short (1h 12EMA > 26EMA): {self.trend_status['short_ema_bullish']} (EMA12: {short_ma:.4f}, EMA26: {long_ma_for_short_trend:.4f})")
+            else:
+                self.trend_status['short_ema_bullish'] = None
+
+            # 2. 中期趋势: MACD (使用1小时图)
+            macd_line, signal_line = await self.trader.get_macd_data()
+            if macd_line is not None and signal_line is not None:
+                macd_histogram = macd_line - signal_line
+                self.trend_status['macd_bullish'] = macd_histogram > 0
+                self.logger.debug(f"Trend: Medium (1h MACD Hist > 0): {self.trend_status['macd_bullish']} (MACD: {macd_line:.4f}, Signal: {signal_line:.4f}, Hist: {macd_histogram:.4f})")
+            else:
+                self.trend_status['macd_bullish'] = None
+
+            # 3. 长期趋势: 价格 vs 200日EMA (使用日线图)
+            current_price = self.trader.current_price # 使用trader中缓存的当前价格
+            if not current_price: # 如果trader没有当前价格，尝试获取一次
+                 current_price = await self.trader._get_latest_price()
+
+            ema_200_period = 200
+            ohlcv_daily_for_long_ema = await self.trader.exchange.fetch_ohlcv(
+                self.trader.symbol,
+                timeframe='1d',
+                limit=ema_200_period + 50
+            )
+            if current_price is not None and ohlcv_daily_for_long_ema and len(ohlcv_daily_for_long_ema) >= ema_200_period:
+                closes_daily = [candle[4] for candle in ohlcv_daily_for_long_ema]
+                # 确保 _calculate_ema 方法存在于 self.trader
+                if hasattr(self.trader, '_calculate_ema') and callable(self.trader._calculate_ema):
+                    ema_200_daily = self.trader._calculate_ema(closes_daily, ema_200_period)
+                    if ema_200_daily != 0 :
+                        self.trend_status['long_ema_bullish'] = current_price > ema_200_daily
+                        self.logger.debug(f"Trend: Long (Price > 200D EMA): {self.trend_status['long_ema_bullish']} (Price: {current_price:.4f}, EMA200D: {ema_200_daily:.4f})")
+                    else:
+                        self.trend_status['long_ema_bullish'] = None
+                else:
+                    self.logger.warning("Trend: self.trader._calculate_ema method not found!")
+                    self.trend_status['long_ema_bullish'] = None
+            else:
+                self.trend_status['long_ema_bullish'] = None
+                self.logger.warning(f"Trend: Insufficient data for 200D EMA or current price unavailable. Daily klines: {len(ohlcv_daily_for_long_ema) if ohlcv_daily_for_long_ema else 'None'}, Current Price: {current_price}")
+
+            # 综合判断是否允许补仓 (严格的三趋势共振：短、中、长期趋势都为True)
+            if self.trend_status['short_ema_bullish'] is True and \
+               self.trend_status['macd_bullish'] is True and \
+               self.trend_status['long_ema_bullish'] is True:
+                self.allow_replenish_based_on_trend = True
+                self.logger.info("三趋势共振判断：允许基于趋势补仓。")
+            else:
+                self.allow_replenish_based_on_trend = False
+                self.logger.info(f"三趋势共振判断：不允许基于趋势补仓。详细状态: Short={self.trend_status['short_ema_bullish']}, Mid(MACD)={self.trend_status['macd_bullish']}, Long={self.trend_status['long_ema_bullish']}")
+            
+            # self.logger.info(f"Trend analysis for replenish updated: Allow={self.allow_replenish_based_on_trend}, Status={self.trend_status}") # 上面已有更详细日志
+
+        except Exception as e:
+            self.logger.error(f"S1 Controller: Failed during trend analysis: {e}", exc_info=True)
+            self.allow_replenish_based_on_trend = False # 保守处理
 
     async def _execute_s1_adjustment(self, side, amount_bnb):
         """
