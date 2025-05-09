@@ -370,16 +370,35 @@ class GridTrader:
                                     # 2. 极端价格区域检查 (例如，不在过去180天日线价格的顶部10%)
                                     # 使用日线数据判断长期高位
                                     long_term_price_percentile = await self._get_price_percentile(timeframe='1d', limit=180)
-                                    HIGH_PERCENTILE_THRESHOLD = getattr(self.config, 'REPLENISH_HIGH_PERCENTILE_THRESHOLD', 0.90) # 从配置读取或默认0.90
                                     
-                                    if long_term_price_percentile >= HIGH_PERCENTILE_THRESHOLD:
+                                    # --- 动态调整 HIGH_PERCENTILE_THRESHOLD ---
+                                    base_high_percentile_threshold = getattr(self.config, 'REPLENISH_HIGH_PERCENTILE_THRESHOLD', 0.90)
+                                    dynamic_high_percentile_threshold = base_high_percentile_threshold
+                                    
+                                    long_ema_bullish_status = self.position_controller_s1.trend_status.get('long_ema_bullish')
+
+                                    # 建议将调整因子和上下限配置化，此处为示例值
+                                    bullish_factor = getattr(self.config, 'THRESHOLD_BULLISH_FACTOR', 1.1)
+                                    bearish_factor = getattr(self.config, 'THRESHOLD_BEARISH_FACTOR', 0.9)
+                                    max_cap = getattr(self.config, 'THRESHOLD_MAX_CAP', 0.95)
+                                    min_floor = getattr(self.config, 'THRESHOLD_MIN_FLOOR', 0.85)
+
+                                    if long_ema_bullish_status is True:
+                                        dynamic_high_percentile_threshold = min(base_high_percentile_threshold * bullish_factor, max_cap)
+                                    elif long_ema_bullish_status is False:
+                                        dynamic_high_percentile_threshold = max(base_high_percentile_threshold * bearish_factor, min_floor)
+                                    
+                                    self.logger.info(f"价格分位阈值动态调整: 基础={base_high_percentile_threshold:.3f}, 长期趋势看涨={long_ema_bullish_status}, 动态阈值={dynamic_high_percentile_threshold:.3f}")
+                                    # --- 结束动态调整 ---
+                                    
+                                    if long_term_price_percentile >= dynamic_high_percentile_threshold: # 使用动态阈值
                                         self.logger.info(
                                             f"主动补仓条件检查：当前价格处于过去180日价格的较高区域 "
-                                            f"(分位: {long_term_price_percentile*100:.1f}%，阈值: {HIGH_PERCENTILE_THRESHOLD*100:.1f}%)，不允许补仓。"
+                                            f"(分位: {long_term_price_percentile*100:.1f}%，动态阈值: {dynamic_high_percentile_threshold*100:.1f}%)，不允许补仓。"
                                         )
                                     else:
                                         self.logger.info(
-                                            f"主动补仓条件检查：当前价格未处于极端高位 (分位: {long_term_price_percentile*100:.1f}%). "
+                                            f"主动补仓条件检查：当前价格未处于极端高位 (分位: {long_term_price_percentile*100:.1f}%, 动态阈值: {dynamic_high_percentile_threshold*100:.1f}%). "
                                             "准备执行主动补仓计算。"
                                         )
                                         # --- 执行主动补仓逻辑 ---
@@ -1104,11 +1123,24 @@ class GridTrader:
         返回值越接近1.0，表示当前价格在历史数据中越高。
         """
         try:
+            # --- 动态调整limit ---
+            current_volatility = await self._calculate_volatility()
+            adjusted_limit = limit
+            # 建议将波动率阈值和调整因子配置化，此处为示例值
+            volatility_threshold = getattr(self.config, 'PERCENTILE_VOLATILITY_THRESHOLD', 0.3)
+            limit_adjustment_factor = getattr(self.config, 'PERCENTILE_LIMIT_ADJUST_FACTOR', 0.7)
+
+            if current_volatility is not None and current_volatility > volatility_threshold:
+                adjusted_limit = int(limit * limit_adjustment_factor)
+                self.logger.info(f"价格分位窗口调整：波动率 {current_volatility:.4f} > {volatility_threshold}，limit 从 {limit} 调整为 {adjusted_limit}")
+            # --- 结束动态调整 ---
+
             # 获取历史K线数据。多取一根K线，最后一根用来确定比较价格，之前的是历史数据。
-            ohlcv = await self.exchange.fetch_ohlcv(self.config.SYMBOL, timeframe, limit=limit + 1)
+            # 使用 adjusted_limit
+            ohlcv = await self.exchange.fetch_ohlcv(self.config.SYMBOL, timeframe, limit=adjusted_limit + 1) # 如果实现了get_cached_ohlcv，则使用它
             
-            if not ohlcv or len(ohlcv) <= limit * 0.5: # 需要足够的数据点, e.g. 至少一半
-                self.logger.warning(f"获取价格分位数据不足: timeframe={timeframe}, limit={limit}, 得到 {len(ohlcv) if ohlcv else 0} 根K线.")
+            if not ohlcv or len(ohlcv) <= adjusted_limit * 0.5: # 需要足够的数据点
+                self.logger.warning(f"获取价格分位数据不足: timeframe={timeframe}, limit(adj)={adjusted_limit}, 得到 {len(ohlcv) if ohlcv else 0} 根K线.")
                 return 0.5 # 数据不足时返回中性值
 
             # 使用倒数第二根K线及之前的所有收盘价作为历史数据
@@ -1117,12 +1149,10 @@ class GridTrader:
             current_price_for_percentile = float(ohlcv[-1][4])
 
             if not historical_closes:
-                self.logger.warning(f"历史收盘价数据为空 (timeframe={timeframe}, limit={limit})，无法计算价格分位。")
+                self.logger.warning(f"历史收盘价数据为空 (timeframe={timeframe}, limit(adj)={adjusted_limit})，无法计算价格分位。")
                 return 0.5
 
             # 计算 current_price_for_percentile 在 historical_closes 中的百分位
-            # (有多少历史价格 < 当前价格) / 总历史价格数
-            # 为了更精确，可以使用 (num_less + 0.5 * num_equal) / total_count
             num_less = 0
             num_equal = 0
             for p_hist in historical_closes:
@@ -1132,14 +1162,14 @@ class GridTrader:
                     num_equal += 1
             
             total_historical_points = len(historical_closes)
-            if total_historical_points == 0: # 理论上不会到这里
+            if total_historical_points == 0:
                  return 0.5
 
             percentile = (num_less + 0.5 * num_equal) / total_historical_points
             
             self.logger.debug(
                 f"价格分位计算: 当前比较价格 {current_price_for_percentile:.4f} (基于 {timeframe} 最新K线收盘价), "
-                f"历史周期 {timeframe}, 历史K线数 {total_historical_points}, 计算分位 {percentile:.4f}"
+                f"历史周期 {timeframe}, 历史K线数 {total_historical_points} (原始limit: {limit}, 调整后: {adjusted_limit}), 计算分位 {percentile:.4f}"
             )
             return min(max(percentile, 0.0), 1.0) #确保在0-1之间
 
