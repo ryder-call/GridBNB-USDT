@@ -11,6 +11,9 @@ class ExchangeClient:
         self.logger = logging.getLogger(self.__class__.__name__)
         self._verify_credentials()
         
+        # 获取代理配置，如果环境变量中没有设置，则使用None
+        proxy = os.getenv('HTTP_PROXY')
+        
         # 先初始化交易所实例
         self.exchange = ccxt.binance({
             'apiKey': os.getenv('BINANCE_API_KEY'),
@@ -31,13 +34,15 @@ class ExchangeClient:
                 'warnOnFetchOpenOrdersWithoutSymbol': False,
                 'createMarketBuyOrderRequiresPrice': False
             },
-            'proxies': None,  # 完全禁用代理
+            'aiohttp_proxy': proxy,  # 使用环境变量中的代理配置
             'verbose': DEBUG_MODE
         })
-        
+        if proxy:
+            self.logger.info(f"使用代理: {proxy}")
         # 然后进行其他配置
         self.logger.setLevel(logging.INFO)
         self.logger.info("交易所客户端初始化完成")
+
         
         self.markets_loaded = False
         self.time_diff = 0
@@ -201,7 +206,39 @@ class ExchangeClient:
         except Exception as e:
             self.logger.error(f"下单失败: {str(e)}")
             raise
-    
+
+    async def create_market_order(
+        self,
+        symbol: str,
+        side: str,          # 只能是 'buy' 或 'sell'
+        amount: float,
+        params: dict | None = None
+    ):
+        """
+        业务层需要的『市价单快捷封装』。
+        实际还是调 ccxt 的 create_order，只是把 type 固定为 'market'。
+        """
+        # 确保有 params 字典
+        params = params or {}
+
+        # 下单前同步时间，避免 -1021 错误
+        await self.sync_time()
+        params.update({
+            'timestamp': int(time.time() * 1000 + self.time_diff),
+            'recvWindow': 5000
+        })
+
+        order = await self.exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side=side.lower(),   # ccxt 规范小写
+            amount=amount,
+            price=None,          # 市价单 price 必须是 None
+            params=params
+        )
+        return order
+
+
     async def fetch_order(self, order_id, symbol, params=None):
         if params is None:
             params = {}
